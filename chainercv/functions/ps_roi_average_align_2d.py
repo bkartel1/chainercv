@@ -25,6 +25,8 @@ from chainer.backends import cuda
 from chainer import function
 from chainer.utils import type_check
 
+from chainercv.functions.ps_roi_average_pooling_2d import _outsize
+
 
 def _pair(x):
     if isinstance(x, chainer.utils.collections_abc.Iterable):
@@ -36,22 +38,24 @@ def _get_bounds(p, limit):
     if p < -1 or p > limit:
         # out of range, so it is empty
         return None, None, None
-    if p <= 0:
-        p = 0
+
     low = int(np.floor(p))
-    if low >= limit - 1:
-        high = low = limit - 1
-        p = float(low)
-    else:
-        high = low + 1
+    if low == limit:
+        low = low - 1
+    high = low + 1
+
+    if low <= -1:
+        p = 0
+    elif high >= limit:
+        p = limit - 1
     return p, low, high
 
 
 def _get_bilinear_interp_params(y, x, y_low, x_low, y_high, x_high):
     ly = y - y_low
     lx = x - x_low
-    hy = 1. - ly
-    hx = 1. - lx
+    hy = y_high - y
+    hx = x_high - x
     w1 = hy * hx
     w2 = hy * lx
     w3 = ly * hx
@@ -67,15 +71,15 @@ bool get_bounds(
         // empty
         return false;
     }
-    if (p <= 0) {
-        p = 0;
-    }
     low = (int)p;
-    if (low >= limit - 1) {
-        high = low = limit - 1;
-        p = (T)low;
-    } else {
-        high = low + 1;
+    if (low == limit) {
+        low = low - 1;
+    }
+    high = low + 1;
+    if (low <= -1) {
+        p = (T) 0.0;
+    } else if (high >= limit) {
+        p = (T) (limit - 1);
     }
     return true;
 }
@@ -86,8 +90,8 @@ void get_bilinear_interp_params(
     T &w1, T &w2, T &w3, T &w4) {
     T ly = y - y_low;
     T lx = x - x_low;
-    T hy = 1. - ly;
-    T hx = 1. - lx;
+    T hy = y_high - y;
+    T hx = x_high - x;
     w1 = hy * hx;
     w2 = hy * lx;
     w3 = ly * hx;
@@ -99,33 +103,37 @@ void get_bilinear_interp_params(
 class PSROIAverageAlign2D(function.Function):
 
     def __init__(
-            self, out_c, out_h, out_w, spatial_scale,
+            self, outsize, spatial_scale,
             group_size, sampling_ratio=None
     ):
-        if not (isinstance(out_c, int) and out_c > 0):
+        out_c, out_h, out_w = _outsize(outsize)
+        if out_c is not None and \
+                not (np.issubdtype(type(out_c), np.integer) and out_c > 0):
             raise TypeError(
-                'out_c must be positive integer: {}, {}'
+                'outsize[0] must be positive integer: {}, {}'
                 .format(type(out_c), out_c))
-        if not (isinstance(out_h, int) and out_h > 0):
+        if not (np.issubdtype(type(out_h), np.integer) and out_h > 0):
             raise TypeError(
-                'out_h must be positive integer: {}, {}'
+                'outsize[1] must be positive integer: {}, {}'
                 .format(type(out_h), out_h))
-        if not (isinstance(out_w, int) and out_w > 0):
+        if not (np.issubdtype(type(out_w), np.integer) and out_w > 0):
             raise TypeError(
-                'out_w must be positive integer: {}, {}'
+                'outsize[2] must be positive integer: {}, {}'
                 .format(type(out_w), out_w))
-        if isinstance(spatial_scale, int):
+        if np.issubdtype(type(spatial_scale), np.integer):
             spatial_scale = float(spatial_scale)
-        if not (isinstance(group_size, int) and group_size > 0):
-            raise TypeError(
-                'group_size must be positive integer: {}, {}'
-                .format(type(group_size), group_size))
-        if not (isinstance(spatial_scale, float) and spatial_scale > 0):
+        if not (np.issubdtype(type(spatial_scale), np.floating)
+                and spatial_scale > 0):
             raise TypeError(
                 'spatial_scale must be a positive float number: {}, {}'
                 .format(type(spatial_scale), spatial_scale))
+        if not (np.issubdtype(type(group_size), np.integer)
+                and group_size > 0):
+            raise TypeError(
+                'group_size must be positive integer: {}, {}'
+                .format(type(group_size), group_size))
         sampling_ratio = _pair(sampling_ratio)
-        if not all((isinstance(s, int) and s >= 1) or s is None
+        if not all((np.issubdtype(type(s), np.integer) and s >= 1) or s is None
                    for s in sampling_ratio):
             raise TypeError(
                 'sampling_ratio must be integer >= 1 or a pair of it: {}'
@@ -156,22 +164,33 @@ class PSROIAverageAlign2D(function.Function):
         self._bottom_data_shape = inputs[0].shape
 
         bottom_data, bottom_rois, bottom_roi_indices = inputs
-        channels, height, width = bottom_data.shape[1:]
+        channel, height, width = bottom_data.shape[1:]
+        if self.out_c is None:
+            if channel % (self.group_size * self.group_size) != 0:
+                raise ValueError(
+                    'input channel must be divided by group_size * group_size:'
+                    '{} % {} != 0'
+                    .format(channel, self.group_size * self.group_size))
+            out_c = channel // (self.group_size * self.group_size)
+        else:
+            if channel != self.out_c * self.group_size * self.group_size:
+                raise ValueError(
+                    'input channel must be equal to'
+                    'outsize[0] * group_size * group_size: {} != {}'
+                    .format(channel,
+                            self.out_c * self.group_size * self.group_size))
+            out_c = self.out_c
         n_roi = bottom_rois.shape[0]
         top_data = np.empty(
-            (n_roi, self.out_c, self.out_h, self.out_w), dtype=np.float32)
+            (n_roi, out_c, self.out_h, self.out_w), dtype=np.float32)
 
         spatial_scale = self.spatial_scale
-        pooled_dim = self.out_c
         pooled_height = self.out_h
         pooled_width = self.out_w
         group_size = self.group_size
 
         for i in six.moves.range(top_data.size):
-            pw = i % pooled_width
-            ph = int(i / pooled_width) % pooled_height
-            ctop = int(i / pooled_width / pooled_height) % pooled_dim
-            n = int(i / pooled_width / pooled_height / pooled_dim)
+            n, ctop, ph, pw = np.unravel_index(i, top_data.shape)
 
             roi_batch_ind = bottom_roi_indices[n]
             roi_start_h = bottom_rois[n, 0] * spatial_scale
@@ -220,12 +239,21 @@ class PSROIAverageAlign2D(function.Function):
                     w1, w2, w3, w4 = _get_bilinear_interp_params(
                         y, x, y_low, x_low, y_high, x_high)
 
-                    v1 = bottom_data[roi_batch_ind, c, y_low, x_low]
-                    v2 = bottom_data[roi_batch_ind, c, y_low, x_high]
-                    v3 = bottom_data[roi_batch_ind, c, y_high, x_low]
-                    v4 = bottom_data[roi_batch_ind, c, y_high, x_high]
+                    if w1 > 0 and y_low >= 0 and x_low >= 0:
+                        v1 = bottom_data[roi_batch_ind, c, y_low, x_low]
+                        output_val += w1 * v1
 
-                    output_val += w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4
+                    if w2 > 0 and y_low >= 0 and x_high <= width - 1:
+                        v2 = bottom_data[roi_batch_ind, c, y_low, x_high]
+                        output_val += w2 * v2
+
+                    if w3 > 0 and y_high <= height - 1 and x_low >= 0:
+                        v3 = bottom_data[roi_batch_ind, c, y_high, x_low]
+                        output_val += w3 * v3
+
+                    if w4 > 0 and y_high <= height - 1 and x_high <= width - 1:
+                        v4 = bottom_data[roi_batch_ind, c, y_high, x_high]
+                        output_val += w4 * v4
 
                     # }}
 
@@ -239,10 +267,25 @@ class PSROIAverageAlign2D(function.Function):
         self._bottom_data_shape = inputs[0].shape
 
         bottom_data, bottom_rois, bottom_roi_indices = inputs
-        channels, height, width = bottom_data.shape[1:]
+        channel, height, width = bottom_data.shape[1:]
+        if self.out_c is None:
+            if channel % (self.group_size * self.group_size) != 0:
+                raise ValueError(
+                    'input channel must be divided by group_size * group_size:'
+                    '{} % {} != 0'
+                    .format(channel, self.group_size * self.group_size))
+            out_c = channel // (self.group_size * self.group_size)
+        else:
+            if channel != self.out_c * self.group_size * self.group_size:
+                raise ValueError(
+                    'input channel must be equal to'
+                    'outsize[0] * group_size * group_size: {} != {}'
+                    .format(channel,
+                            self.out_c * self.group_size * self.group_size))
+            out_c = self.out_c
         n_roi = bottom_rois.shape[0]
         top_data = cuda.cupy.empty(
-            (n_roi, self.out_c, self.out_h, self.out_w), dtype=np.float32)
+            (n_roi, out_c, self.out_h, self.out_w), dtype=np.float32)
 
         if self.sampling_ratio[0] is None:
             sampling_ratio_h = 0
@@ -255,7 +298,7 @@ class PSROIAverageAlign2D(function.Function):
         cuda.elementwise(
             '''
             raw T bottom_data, raw T bottom_rois, raw int32 bottom_roi_indices,
-            T spatial_scale, int32 channels, int32 height, int32 width,
+            T spatial_scale, int32 channel, int32 height, int32 width,
             int32 pooled_dim, int32 pooled_height, int32 pooled_width,
             int32 group_size, int32 sampling_ratio_h, int32 sampling_ratio_w
             ''',
@@ -291,7 +334,7 @@ class PSROIAverageAlign2D(function.Function):
             int c = (ctop * group_size + gh) * group_size + gw;
 
             int bottom_data_offset =
-                (roi_batch_ind * channels + c) * height * width;
+                (roi_batch_ind * channel + c) * height * width;
 
             // We use roi_bin_grid to sample the grid and mimic integral
             int roi_bin_grid_h = (sampling_ratio_h > 0)
@@ -325,17 +368,30 @@ class PSROIAverageAlign2D(function.Function):
                     get_bilinear_interp_params(
                         y, x, y_low, x_low, y_high, x_high, w1, w2, w3, w4);
 
-                    T v1 = bottom_data[bottom_data_offset +
-                                           y_low * width + x_low];
-                    T v2 = bottom_data[bottom_data_offset +
-                                           y_low * width + x_high];
-                    T v3 = bottom_data[bottom_data_offset +
-                                           y_high * width + x_low];
-                    T v4 = bottom_data[bottom_data_offset +
-                                           y_high * width + x_high];
+                    if (w1 > 0 && y_low >= 0 && x_low >= 0) {
+                        T v1 = bottom_data[
+                            bottom_data_offset + y_low * width + x_low];
+                        output_val += w1 * v1;
+                    }
+                    if (w2 > 0 && y_low >= 0 && x_high <= width - 1) {
+                        T v2 = bottom_data[
+                            bottom_data_offset + y_low * width + x_high];
+                        output_val += w2 * v2;
+                    }
+                    if (w3 > 0 && y_high <= height - 1 && x_low >= 0) {
+                        T v3 = bottom_data[
+                            bottom_data_offset + y_high * width + x_low];
+                        output_val += w3 * v3;
+                    }
+                    if (w4 > 0 && y_high <= height - 1 &&
+                            x_high <= width - 1) {
+                        T v4 = bottom_data[
+                            bottom_data_offset + y_high * width + x_high];
+                        output_val += w4 * v4;
+                    }
+
                     // }}
 
-                    output_val += (w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
                 }
             }
             output_val /= count;
@@ -345,29 +401,25 @@ class PSROIAverageAlign2D(function.Function):
             'ps_roi_average_align_2d_fwd',
             preamble=_GET_BILINEAR_INTERP_KERNEL,
         )(bottom_data, bottom_rois, bottom_roi_indices,
-          self.spatial_scale, channels, height, width,
-          self.out_c, self.out_h, self.out_w, self.group_size,
+          self.spatial_scale, channel, height, width,
+          out_c, self.out_h, self.out_w, self.group_size,
           sampling_ratio_h, sampling_ratio_w, top_data)
 
         return top_data,
 
     def backward_cpu(self, inputs, gy):
         _, bottom_rois, bottom_roi_indices = inputs
-        channels, height, width = self._bottom_data_shape[1:]
+        height, width = self._bottom_data_shape[2:]
         bottom_diff = np.zeros(self._bottom_data_shape, np.float32)
 
         spatial_scale = self.spatial_scale
-        pooled_dim = self.out_c
         pooled_height = self.out_h
         pooled_width = self.out_w
         group_size = self.group_size
         top_diff = gy[0]
 
         for i in six.moves.range(top_diff.size):
-            pw = i % pooled_width
-            ph = int(i / pooled_width) % pooled_height
-            ctop = int(i / pooled_width / pooled_height) % pooled_dim
-            n = int(i / pooled_width / pooled_height / pooled_dim)
+            n, ctop, ph, pw = np.unravel_index(i, top_diff.shape)
 
             roi_batch_ind = int(bottom_roi_indices[n])
             roi_start_h = bottom_rois[n, 0] * spatial_scale
@@ -416,24 +468,30 @@ class PSROIAverageAlign2D(function.Function):
                     w1, w2, w3, w4 = _get_bilinear_interp_params(
                         y, x, y_low, x_low, y_high, x_high)
 
-                    g1 = top_diff_this_bin * w1 / count
-                    g2 = top_diff_this_bin * w2 / count
-                    g3 = top_diff_this_bin * w3 / count
-                    g4 = top_diff_this_bin * w4 / count
-
-                    if (x_low >= 0 and x_high >= 0 and
-                            y_low >= 0 and y_high >= 0):
+                    if w1 > 0 and y_low >= 0 and x_low >= 0:
+                        g1 = top_diff_this_bin * w1 / count
                         bottom_diff[roi_batch_ind, c, y_low, x_low] += g1
+
+                    if w2 > 0 and y_low >= 0 and x_high <= width - 1:
+                        g2 = top_diff_this_bin * w2 / count
                         bottom_diff[roi_batch_ind, c, y_low, x_high] += g2
+
+                    if w3 > 0 and y_high <= height - 1 and x_low >= 0:
+                        g3 = top_diff_this_bin * w3 / count
                         bottom_diff[roi_batch_ind, c, y_high, x_low] += g3
+
+                    if w4 > 0 and y_high <= height - 1 and x_high <= width - 1:
+                        g4 = top_diff_this_bin * w4 / count
                         bottom_diff[roi_batch_ind, c, y_high, x_high] += g4
+
                     # }}
 
         return bottom_diff, None, None
 
     def backward_gpu(self, inputs, gy):
         _, bottom_rois, bottom_roi_indices = inputs
-        channels, height, width = self._bottom_data_shape[1:]
+        channel, height, width = self._bottom_data_shape[1:]
+        out_c, out_h, out_w = gy[0].shape[1:]
         bottom_diff = cuda.cupy.zeros(self._bottom_data_shape, np.float32)
 
         if self.sampling_ratio[0] is None:
@@ -447,7 +505,7 @@ class PSROIAverageAlign2D(function.Function):
         cuda.elementwise(
             '''
             raw T top_diff, raw T bottom_rois, raw int32 bottom_roi_indices,
-            T spatial_scale, int32 channels, int32 height, int32 width,
+            T spatial_scale, int32 channel, int32 height, int32 width,
             int32 pooled_dim, int32 pooled_height, int32 pooled_width,
             int32 group_size, int32 sampling_ratio_h, int32 sampling_ratio_w
             ''',
@@ -484,7 +542,7 @@ class PSROIAverageAlign2D(function.Function):
             int c = (ctop * group_size + gh) * group_size + gw;
 
             int bottom_diff_offset =
-                (roi_batch_ind * channels + c) * height * width;
+                (roi_batch_ind * channel + c) * height * width;
 
             int top_offset =
                 (n * pooled_dim + ctop) * pooled_height * pooled_width;
@@ -522,37 +580,42 @@ class PSROIAverageAlign2D(function.Function):
                     get_bilinear_interp_params(
                         y, x, y_low, x_low, y_high, x_high, w1, w2, w3, w4);
 
-                    T g1 = top_diff_this_bin * w1 / count;
-                    T g2 = top_diff_this_bin * w2 / count;
-                    T g3 = top_diff_this_bin * w3 / count;
-                    T g4 = top_diff_this_bin * w4 / count;
-
-                    if (x_low >= 0 && x_high >= 0 &&
-                            y_low >= 0 && y_high >= 0) {
-                        atomicAdd(&bottom_diff[bottom_diff_offset +
-                                               y_low * width + x_low], g1);
-                        atomicAdd(&bottom_diff[bottom_diff_offset +
-                                               y_low * width + x_high], g2);
-                        atomicAdd(&bottom_diff[bottom_diff_offset +
-                                               y_high * width + x_low], g3);
-                        atomicAdd(&bottom_diff[bottom_diff_offset +
-                                               y_high * width + x_high], g4);
+                    if (w1 > 0 && y_low >= 0 && x_low >= 0) {
+                        T g1 = top_diff_this_bin * w1 / count;
+                        atomicAdd(&bottom_diff[
+                            bottom_diff_offset + y_low * width + x_low], g1);
+                    }
+                    if (w2 > 0 && y_low >= 0 && x_high <= width - 1) {
+                        T g2 = top_diff_this_bin * w2 / count;
+                        atomicAdd(&bottom_diff[
+                            bottom_diff_offset + y_low * width + x_high], g2);
+                    }
+                    if (w3 > 0 && y_high <= height - 1 && x_low >= 0) {
+                        T g3 = top_diff_this_bin * w3 / count;
+                        atomicAdd(&bottom_diff[
+                            bottom_diff_offset + y_high * width + x_low], g3);
+                    }
+                    if (w4 > 0 && y_high <= height - 1 &&
+                            x_high <= width - 1) {
+                        T g4 = top_diff_this_bin * w4 / count;
+                        atomicAdd(&bottom_diff[
+                            bottom_diff_offset + y_high * width + x_high], g4);
                     }
                 }
             }
             ''', 'ps_roi_average_align_2d_bwd',
             preamble=_GET_BILINEAR_INTERP_KERNEL,
         )(gy[0], bottom_rois, bottom_roi_indices,
-          self.spatial_scale, channels, height, width,
-          self.out_c, self.out_h, self.out_w,
-          self.group_size, sampling_ratio_h, sampling_ratio_w,
-          bottom_diff, size=gy[0].size)
+          self.spatial_scale, channel, height, width,
+          out_c, out_h, out_w, self.group_size,
+          sampling_ratio_h, sampling_ratio_w, bottom_diff,
+          size=gy[0].size)
 
         return bottom_diff, None, None
 
 
 def ps_roi_average_align_2d(
-        x, rois, roi_indices, out_c, out_h, out_w,
+        x, rois, roi_indices, outsize,
         spatial_scale, group_size, sampling_ratio=None
 ):
     """Position Sensitive Region of Interest (ROI) Average align function.
@@ -570,9 +633,10 @@ def ps_roi_average_align_2d(
             (y_min, x_min, y_max, x_max). The dtype is :obj:`numpy.float32`.
         roi_indices (array): Input roi indices. The shape is expected to
             be :math:`(R, )`. The dtype is :obj:`numpy.int32`.
-        out_c (int): Channels of output image after pooled.
-        out_h (int): Height of output image after pooled.
-        out_w (int): Width of output image after pooled.
+        outsize ((int, int, int) or (int, int) or int): Expected output size
+            after pooled: (channel, height, width) or (height, width)
+            or outsize. ``outsize=o`` and ``outsize=(o, o)`` are equivalent.
+            Channel parameter is used to assert the input shape.
         spatial_scale (float): Scale of the roi is resized.
         group_size (int): Position sensitive group size.
         sampling_ratio ((int, int) or int): Sampling step for the alignment.
@@ -592,5 +656,5 @@ def ps_roi_average_align_2d(
 
     """
     return PSROIAverageAlign2D(
-        out_c, out_h, out_w, spatial_scale,
+        outsize, spatial_scale,
         group_size, sampling_ratio)(x, rois, roi_indices)
